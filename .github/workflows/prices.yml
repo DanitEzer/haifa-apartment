@@ -1,31 +1,90 @@
-{
- "fx": {
-  "usd": 3.0631,
-  "eur": 3.431,
-  "time": "2026-10-10T12:00:00+00:00",
-  "source": "ערך התחלתי"
- },
- "stocks": {
-  "FOUR": {
-   "price": 40.0,
-   "currency": "USD",
-   "time": "2026-10-09T20:00:00+00:00"
-  },
-  "QQQ": {
-   "price": 751.27,
-   "currency": "USD",
-   "time": "2026-10-09T20:00:00+00:00"
-  },
-  "SPY": {
-   "price": 778.57,
-   "currency": "USD",
-   "time": "2026-10-09T20:00:00+00:00"
-  },
-  "OKLO": {
-   "price": 34.7,
-   "currency": "USD",
-   "time": "2026-10-09T20:00:00+00:00"
-  }
- },
- "updated": "2026-10-10T20:30:00+00:00"
-}
+name: Update prices
+
+# מעדכן את prices.json (שערי דולר/אירו ומחירי מניות) פעם ביום, בבוקר, אחרי סגירת הבורסה בארה״ב.
+on:
+  schedule:
+    - cron: '17 5 * * 2-6'   # שלישי–שבת 05:17 UTC = 08:17 בישראל (אחרי ימי המסחר ב׳–ו׳)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency: prices
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch prices
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request, datetime, csv, io
+
+          # רשימת המניות מגיעה מ-tickers.json (האתר מעדכן אותה לבד כשמוסיפים מניה)
+          try:
+              TICKERS = [str(t).upper() for t in json.load(open("tickers.json"))]
+          except Exception:
+              TICKERS = ["FOUR", "QQQ", "SPY", "OKLO"]
+
+          UA = {"User-Agent": "Mozilla/5.0"}
+          def get(url):
+              with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=20) as r:
+                  return r.read().decode()
+
+          def yahoo(sym):
+              d = json.loads(get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"))
+              m = d["chart"]["result"][0]["meta"]
+              t = datetime.datetime.fromtimestamp(m["regularMarketTime"], datetime.timezone.utc).isoformat()
+              return float(m["regularMarketPrice"]), m.get("currency"), t
+
+          try:
+              old = json.load(open("prices.json"))
+          except Exception:
+              old = {}
+          out = {"fx": old.get("fx", {}), "stocks": old.get("stocks", {})}
+
+          try:
+              usd, eur = yahoo("ILS=X"), yahoo("EURILS=X")
+              out["fx"] = {"usd": round(usd[0], 4), "eur": round(eur[0], 4), "time": usd[2], "source": "Yahoo Finance"}
+          except Exception as e:
+              print("yahoo fx failed:", e)
+              try:
+                  d = json.loads(get("https://api.frankfurter.dev/v1/latest?base=EUR&symbols=ILS,USD"))
+                  out["fx"] = {"usd": round(d["rates"]["ILS"] / d["rates"]["USD"], 4), "eur": round(d["rates"]["ILS"], 4),
+                               "time": d["date"] + "T16:00:00+00:00", "source": "ECB"}
+              except Exception as e2:
+                  print("fx fallback failed:", e2)
+
+          for t in TICKERS:
+              try:
+                  p, cur, tm = yahoo(t)
+              except Exception as e:
+                  print("yahoo", t, "failed:", e)
+                  try:
+                      r = list(csv.DictReader(io.StringIO(get(f"https://stooq.com/q/l/?s={t.lower()}.us&f=sd2t2c&h&e=csv"))))[0]
+                      p, cur, tm = float(r["Close"]), "USD", f'{r["Date"]}T{r["Time"]}Z'
+                  except Exception as e2:
+                      print("stooq", t, "failed:", e2)
+                      continue
+              out["stocks"][t] = {"price": round(p, 4), "currency": cur, "time": tm}
+
+          changed = {k: out[k] for k in ("fx", "stocks")} != {k: old.get(k) for k in ("fx", "stocks")}
+          out["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds") if changed else old.get("updated")
+          json.dump(out, open("prices.json", "w"), indent=1, ensure_ascii=False)
+          print(json.dumps(out, ensure_ascii=False))
+          PY
+
+      - name: Commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "prices-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add prices.json
+          if git diff --cached --quiet; then echo "no change"; exit 0; fi
+          git commit -m "Update prices"
+          git push
+          gh api -X POST "repos/${{ github.repository }}/pages/builds" >/dev/null 2>&1 || true
